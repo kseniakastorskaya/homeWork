@@ -1,7 +1,0 @@
-globals:
-  MAX_CONN: 100
-  PORT: 8080
-statements:
-- server_name: main
-  max_connections: 100
-  listen_port: 8080

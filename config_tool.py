@@ -1,206 +1,205 @@
 import sys
+import argparse
 import yaml
-from lark import Lark, Transformer, v_args, UnexpectedInput
+from lark import Lark, Transformer, UnexpectedInput, Tree
+
+# ================== GRAMMAR ==================
 
 GRAMMAR = r"""
-?start: config
+start: statement+
 
-config: (global_decl)* expr*
+statement: global_decl
+         | value
 
-global_decl: "global" IDENT "=" value
+global_decl: "global" NAME "=" value
 
-?expr: dict
-     | list
-
-dict: "([" pair_list "])"
-list: "[" value_list "]"
-
-pair_list: (pair ("," pair)* (","?) )?
-pair: IDENT ":" value
-
-value_list: (value ("," value)* (","?) )?
-
-?value: NUMBER           -> num
+?value: NUMBER           -> number
       | STRING           -> string
-      | IDENT            -> ident_value
       | dict
-      | list
-      | expr_const
+      | rpn_expr
+      | NAME             -> reference
 
-expr_const: ".(" rpn_list ")."
-rpn_list: (IDENT | NUMBER | OP | FUNC)+
+dict: "([" pair ("," pair)* ","? "])"
+pair: NAME ":" value
 
-OP: "+"|"-"|"*"|"/"
+rpn_expr: ".(" rpn_item+ ")."
+rpn_item: NUMBER | NAME | OP | FUNC
+
+OP: "+" | "-" | "*"
 FUNC: "mod"
 
-IDENT: /[A-Za-z_][A-Za-z0-9_]*/
+NAME: /[_A-Z][_a-zA-Z0-9]*/
 STRING: /'[^']*'/
-NUMBER: /-?\d+/
+NUMBER: /[+-]?\d+/
 
-%import common.WS
-%ignore WS
+COMMENT: "=begin" /(.|\n)*?/ "=end"
+
+%ignore COMMENT
+%ignore /[ \t\r\n]+/
 """
 
-# ------------------ Transformer ------------------
+# ================== TRANSFORMER ==================
 
 
-@v_args(inline=True)
-class ConfigTransformer(Transformer):
+class ASTTransformer(Transformer):
     def __init__(self):
-        super().__init__()
         self.globals = {}
 
-    # ---------- Globals ----------
-    def global_decl(self, name, value):
-        self.globals[str(name)] = value
-        return ("global", str(name), value)
+    def start(self, items):
+        return items
 
-    # ---------- Values ----------
-    def num(self, n):
-        return int(n)
+    def statement(self, items):
+        return items[0]
 
-    def string(self, s):
-        return s[1:-1]
+    def global_decl(self, items):
+        name = str(items[0])
+        value = items[1]
+        self.globals[name] = value
+        return ("global", name, value)
 
-    def ident_value(self, name):
-        key = str(name)
-        if key in self.globals:
-            return self.globals[key]
-        else:
-            raise ValueError(f"Unknown identifier: {key}")
+    def number(self, items):
+        return int(items[0])
 
-    # ---------- RPN ----------
-    def expr_const(self, rpn_tree):
-        # rpn_tree может быть Tree или list
-        tokens = getattr(rpn_tree, "children", rpn_tree)
-        stack = []
-        for tok in tokens:
-            tok_str = str(tok)
-            if isinstance(tok, int):
-                stack.append(tok)
-            elif tok_str in self.globals:
-                stack.append(self.globals[tok_str])
-            elif tok_str.isdigit() or (
-                tok_str.startswith("-") and tok_str[1:].isdigit()
-            ):
-                stack.append(int(tok_str))
-            elif tok_str in ["+", "-", "*", "/", "mod"]:
-                b = stack.pop()
-                a = stack.pop()
-                if tok_str == "+":
-                    stack.append(a + b)
-                elif tok_str == "-":
-                    stack.append(a - b)
-                elif tok_str == "*":
-                    stack.append(a * b)
-                elif tok_str == "/":
-                    stack.append(a // b)
-                elif tok_str == "mod":
-                    stack.append(a % b)
-            else:
-                raise ValueError(f"Unknown token in RPN: {tok_str}")
-        if len(stack) != 1:
-            raise ValueError("Invalid RPN expression")
-        return stack[0]
+    def string(self, items):
+        return items[0][1:-1]
 
-    # ---------- Structures ----------
-    def pair(self, key, value):
-        return (str(key), value)
+    def reference(self, items):
+        return ("ref", str(items[0]))
 
-    def pair_list(self, *pairs):
-        d = {}
-        for p in pairs:
-            if isinstance(p, tuple) and len(p) == 2:
-                d[p[0]] = p[1]
-        return d
-
-    def value_list(self, *vals):
-        return list(vals)
+    def pair(self, items):
+        return (str(items[0]), items[1])
 
     def dict(self, items):
-        if isinstance(items, dict):
-            return items
-        elif isinstance(items, list):
-            d = {}
-            for x in items:
-                if isinstance(x, dict):
-                    d.update(x)
-            return d
-        return {}
+        return dict(items)
 
-    def list(self, items):
-        if isinstance(items, list):
-            return items
-        return [items]
+    def rpn_expr(self, items):
+        return ("rpn", items)
 
-    # ---------- Root ----------
-    def config(self, *items):
-        # возвращаем только выражения (не глобалы)
-        return [i for i in items if not (isinstance(i, tuple) and i[0] == "global")]
+    def rpn_item(self, items):
+        return items[0]
 
 
-# ------------------ CLI functions ------------------
+# ================== INTERPRETER ==================
 
 
-def assemble(input_path, output_path, test_mode=False):
-    parser = Lark(GRAMMAR, parser="lalr")
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    try:
-        tree = parser.parse(text)
-        trans = ConfigTransformer()
-        statements = trans.transform(tree)
+def interp(tree, env):
+    # 🔹 FIX 1: unwrap Tree
+    if isinstance(tree, Tree):
+        if len(tree.children) == 1:
+            return interp(tree.children[0], env)
+        return interp(tree.children, env)
 
-        # Save to YAML
-        with open(output_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                {"globals": trans.globals, "statements": statements},
-                f,
-                sort_keys=False,
-                allow_unicode=True,
-            )
+    if isinstance(tree, int):
+        return tree
 
-        if test_mode:
-            print("Globals:")
-            for k, v in trans.globals.items():
-                print(f"  {k} = {v}")
-            print("Statements:")
-            print(statements)
+    if isinstance(tree, str):
+        return tree
 
-        print(f"Wrote IR to {output_path}")
+    if isinstance(tree, dict):
+        return {k: interp(v, env) for k, v in tree.items()}
 
-    except UnexpectedInput as e:
-        print(f"Syntax error in {input_path}: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    if isinstance(tree, list):
+        result = []
+        for item in tree:
+            res = interp(item, env)
+            if res is not None:
+                result.append(res)
+        return result
+
+    if isinstance(tree, tuple):
+        tag = tree[0]
+
+        if tag == "global":
+            _, name, value = tree
+            env[name] = interp(value, env)
+            return None
+
+        if tag == "ref":
+            name = tree[1]
+            if name not in env:
+                raise ValueError(f"Unknown identifier: {name}")
+            return env[name]
+
+        if tag == "rpn":
+            tokens = tree[1]
+            stack = []
+
+            for tok in tokens:
+                if isinstance(tok, int):
+                    stack.append(tok)
+                elif isinstance(tok, str) and tok in env:
+                    stack.append(env[tok])
+                elif tok in {"+", "-", "*", "mod"}:
+                    b = stack.pop()
+                    a = stack.pop()
+                    if tok == "+":
+                        stack.append(a + b)
+                    elif tok == "-":
+                        stack.append(a - b)
+                    elif tok == "*":
+                        stack.append(a * b)
+                    elif tok == "mod":
+                        stack.append(a % b)
+                else:
+                    raise ValueError(f"Unknown RPN token: {tok}")
+
+            if len(stack) != 1:
+                raise ValueError("Invalid RPN expression")
+
+            return stack[0]
+
+    raise ValueError(f"Unsupported AST node: {tree}")
 
 
-# ------------------ Main ------------------
+# ================== CLI ==================
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(
-        description="Config language tool: parse -> IR -> YAML"
+        description="Educational configuration language → YAML"
     )
-    sub = parser.add_subparsers(dest="cmd")
-
-    p_assemble = sub.add_parser("assemble", help="Assemble source to IR (YAML)")
-    p_assemble.add_argument("infile")
-    p_assemble.add_argument("outfile")
-    p_assemble.add_argument("--test", action="store_true")
+    parser.add_argument("--input", required=True, help="Input config file")
+    parser.add_argument("--output", required=True, help="Output YAML file")
+    parser.add_argument("--test", action="store_true", help="Debug output")
 
     args = parser.parse_args()
 
-    if args.cmd == "assemble":
-        assemble(args.infile, args.outfile, args.test)
-    else:
-        parser.print_help()
+    try:
+        with open(args.input, encoding="utf-8") as f:
+            text = f.read()
+
+        parser_lark = Lark(GRAMMAR, parser="lalr")
+        tree = parser_lark.parse(text)
+
+        transformer = ASTTransformer()
+        ast = transformer.transform(tree)
+
+        env = {}
+        result = interp(ast, env)
+
+        with open(args.output, "w", encoding="utf-8") as f:
+            yaml.safe_dump(result, f, allow_unicode=True)
+
+        if args.test:
+            print("Globals:")
+            print(env)
+            print("Result:")
+            print(result)
+
+        print(f"✔ YAML written to {args.output}")
+
+    except UnexpectedInput as e:
+        print("❌ Syntax error:")
+        print(e)
         sys.exit(1)
 
+    except Exception as e:
+        print("❌ Error:")
+        print(e)
+        sys.exit(1)
+
+
+# ================== ENTRY ==================
 
 if __name__ == "__main__":
     main()
